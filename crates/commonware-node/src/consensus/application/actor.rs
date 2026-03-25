@@ -10,7 +10,10 @@
 //! deterministic runtime to spend real life time to wait for the execution
 //! layer calls to complete.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{B256, Bytes};
@@ -34,6 +37,7 @@ use reth_ethereum::chainspec::EthChainSpec as _;
 use reth_node_builder::{Block as _, BuiltPayload, ConsensusEngineHandle};
 use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
 use tempo_node::{TempoExecutionData, TempoFullNode, TempoPayloadTypes};
+use tempo_telemetry_util::display_duration;
 
 use reth_provider::{BlockHashReader as _, BlockReader as _};
 use tempo_payload_types::TempoPayloadAttributes;
@@ -436,6 +440,8 @@ impl Inner<Init> {
         parent_digest: Digest,
         round: Round,
     ) -> eyre::Result<Block> {
+        let propose_start = Instant::now();
+
         let parent = get_parent(
             &self.execution_node,
             round,
@@ -563,24 +569,29 @@ impl Inner<Init> {
             .await
             .wrap_err("failed requesting a new payload build")?;
 
+        let elapsed = propose_start.elapsed();
+        let remaining_resolve = self.payload_resolve_time.saturating_sub(elapsed);
+        let remaining_return = self.payload_return_time.saturating_sub(elapsed);
         debug!(
-            resolve_time_ms = self.payload_resolve_time.as_millis(),
-            return_time_ms = self.payload_return_time.as_millis(),
+            elapsed = %display_duration(elapsed),
+            resolve_time = %display_duration(remaining_resolve),
+            return_time = %display_duration(remaining_return),
             "sleeping before payload builder resolving"
         );
 
-        // Start the timer for `self.payload_return_time`
+        // Start the timer for `remaining_return`
         //
-        // This guarantees that we will not propose the block too early, and waits for at least `self.payload_return_time`,
+        // This guarantees that we will not propose the block too early, and waits for at least
+        // `remaining_return` (`payload_return_time` minus time already spent in propose),
         // plus whatever time is needed to finish building the block.
-        let payload_return_time = context.current() + self.payload_return_time;
+        let payload_return_time = context.current() + remaining_return;
 
-        // Give payload builder at least `self.payload_resolve_time` until we interrupt it.
+        // Give payload builder at least `remaining_resolve` until we interrupt it.
         //
         // The interrupt doesn't mean we'll immediately get the payload back,
         // but only signals the builder to stop executing transactions,
         // and start calculating the state root and sealing the block.
-        context.sleep(self.payload_resolve_time).await;
+        context.sleep(remaining_resolve).await;
 
         interrupt_handle.interrupt();
 
@@ -597,7 +608,7 @@ impl Inner<Init> {
             .and_then(|rsp| rsp.map_err(Into::<eyre::Report>::into))
             .wrap_err_with(|| format!("failed getting payload for payload ID `{payload_id}`"))?;
 
-        // Keep waiting for `self.payload_return_time`, if there's anything left after building the block.
+        // Keep waiting for the remaining return time, if there's anything left after building the block.
         context.sleep_until(payload_return_time).await;
 
         Ok(Block::from_execution_block(payload.block().clone()))
